@@ -16,7 +16,7 @@ const uri = "bolt://localhost:7687";
 var session = null;
 var driver = null;
 var startBlock = -1;
-// var startBlock = 238687;
+//var startBlock = 238687;
 
 var isFunction = (f) => {
     return (typeof f === 'function');
@@ -103,6 +103,17 @@ let createScheme = () => {
         .run('CREATE CONSTRAINT ON (block:Block) ASSERT block.blockNumber IS UNIQUE')
         .then((result) => {
             winston.log('debug', 'Database index/constraint for block created');
+        })
+        .catch((error) => {
+            winston.log('error', 'Neo4jConnector - Could not create database scheme', {
+                error: err.message
+            });
+        });
+
+    session
+        .run('CREATE INDEX ON :Transaction(hash)')
+        .then((result) => {
+            winston.log('debug', 'Database index/constraint for transaction created');
         })
         .catch((error) => {
             winston.log('error', 'Neo4jConnector - Could not create database scheme', {
@@ -310,7 +321,7 @@ var chainBlocks = (tx, block, checkedAccounts, callback) => {
                                     //edge: record
                                 });
 
-                                /*********************** create the transaction edge **************/
+                                /*********************** create the chain edge **************/
                                 if (block.number === (startBlock + 1)) {
                                     callback(null, true);
                                 } else {
@@ -563,49 +574,43 @@ var createAccounts = (tx, accounts, callback) => {
 var insertTransaction = (tx, transaction, checkedAccounts) => {
     /*********** If the accounts/contracts are not created as nodes yet, we have to do it here ************/
     return new Promise((resolve, reject) => {
-        /*********************** Insert transactions as edges **************/
-        // Insert the transactions as edges between the sending and
-        // receiving account/contract: (Account) ---transaction ---> (Account)
-        // [   Alternatively: (Account) ----out----> (Transaction) ----in----> (Account)   ]
-        insertTransactionEdge(tx, transaction, (err, res) => {
+        /*********************** Insert transactions as nodes and create **************/
+        /*** edges from the block which contains it and from/to accounts **************/
+        // [ (Account) ----out----> (Transaction) ----in----> (Account) ]
+
+        insertTransactionNode(tx, transaction, (err, res) => {
             if (err) reject(err); else {
-                resolve(transaction);
+                insertTransactionBlockEdge(tx, transaction, (err, res) => {
+                    if (err) reject(err); else {
+                        insertTransactionFromEdge(tx, transaction, (err, res) => {
+                            if (err) reject(err); else {
+                                insertTransactionToEdge(tx, transaction, (err, res) => {
+                                    if (err) reject(err); else {
+                                        resolve(transaction);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
             }
-        });
+        })
     })
 };
 
-/**
- * Creates edges from one block-node the its predecessor
- * @param tx
- * @param block
- * @param callback
- */
-var insertTransactionEdge = (tx, transaction, callback) => {
-
-    // chain the account/contract nodes with edges representing the transaction
-    let queryCreateTransactionEdge = 'MATCH (aFrom:Account {address: $fromAddress}), (aTo:Account {address: $toAddress}) ' +
-        'CREATE (aFrom)-[t:Transaction { to: $toAddress, from: $fromAddress,  ' +
-        'blockNumber: $blockNumber, transactionIndex: $transactionIndex, value: $value, gas: $gas, ' +
-        'gasPrice: $gasPrice, input: $input}]->(aTo) RETURN t LIMIT 1 ';
-    let paramsCreateTransactionEdge = {
+var insertTransactionFromEdge = (tx, transaction, callback) => {
+    let queryCreateContainsEdge = 'MATCH (transaction:Transaction {hash: $hash}), (account:Account {address: $fromAddress}) ' +
+        'CREATE (account)-[from:From ]->(transaction) RETURN from LIMIT 1 ';
+    let paramsCreateContainsEdge = {
+        hash: transaction.hash,
         fromAddress: transaction.from,
-        blockNumber: neo4j.int(transaction.blockNumber),
-        transactionIndex: neo4j.int(transaction.transactionIndex),
-        value: neo4j.int(transaction.value), // value is a web3 BigNumber
-        gas: neo4j.int(transaction.gas),
-        gasPrice: neo4j.int(transaction.gasPrice), // gas price is a web3 BigNumber
-        input: transaction.input,
-        toAddress: transaction.to
     };
-
-    tx.run(queryCreateTransactionEdge, paramsCreateTransactionEdge)
+    tx.run(queryCreateContainsEdge, paramsCreateContainsEdge)
         .subscribe({
             onNext: (record) => {
-                winston.log('debug', 'Neo4jConnector - New edge between accounts inserted representing a transaction', {
+                winston.log('debug', 'Neo4jConnector - New edge from account to transaction was created', {
                     //edge: record
                 });
-
                 callback(null, record);
             },
             onError: (error) => {
@@ -615,7 +620,95 @@ var insertTransactionEdge = (tx, transaction, callback) => {
                 callback(error, null);
             }
         });
+};
 
+var insertTransactionToEdge = (tx, transaction, callback) => {
+    let queryCreateContainsEdge = 'MATCH (transaction:Transaction {hash: $hash}), (account:Account {address: $toAddress}) ' +
+        'CREATE (transaction)-[to:To ]->(account) RETURN to LIMIT 1 ';
+    let paramsCreateContainsEdge = {
+        hash: transaction.hash,
+        toAddress: transaction.to,
+    };
+    tx.run(queryCreateContainsEdge, paramsCreateContainsEdge)
+        .subscribe({
+            onNext: (record) => {
+                winston.log('debug', 'Neo4jConnector - New edge from transaction to account was created', {
+                    //edge: record
+                });
+                callback(null, record);
+            },
+            onError: (error) => {
+                winston.log('error', 'Neo4jConnector - Transaction statement failed:', {
+                    error: error.message
+                });
+                callback(error, null);
+            }
+        });
+};
+
+var insertTransactionBlockEdge = (tx, transaction, callback) => {
+    // chain the transaction nodes with block node, which contains it
+    let queryCreateContainsEdge = 'MATCH (transaction:Transaction {hash: $hash}), (block:Block {blockNumber: $blockNumber}) ' +
+        'CREATE (block)-[contains:Contains ]->(transaction) RETURN contains LIMIT 1 ';
+    let paramsCreateContainsEdge = {
+        blockNumber: neo4j.int(transaction.blockNumber),
+        hash: transaction.hash
+    };
+    tx.run(queryCreateContainsEdge, paramsCreateContainsEdge)
+        .subscribe({
+            onNext: (record) => {
+                winston.log('debug', 'Neo4jConnector - New transaction was added to the block which contains it', {
+                    //edge: record
+                });
+                callback(null, record);
+            },
+            onError: (error) => {
+                winston.log('error', 'Neo4jConnector - Transaction statement failed:', {
+                    error: error.message
+                });
+                callback(error, null);
+            }
+        });
+};
+
+var insertTransactionNode = (tx, transaction, callback) => {
+    let transactionResult = null;
+    // create a Block node
+    // run statement in a transaction
+    let queryCreateTransactionNode = 'CREATE (t:Transaction { to: $toAddress, from: $fromAddress,  ' +
+        'blockNumber: $blockNumber, transactionIndex: $transactionIndex, value: $value, gas: $gas, ' +
+        'gasPrice: $gasPrice, input: $input, blockHash: $blockHash, hash: $hash}) RETURN t LIMIT 1';
+    let paramsCreateTransactionNode = {
+        fromAddress: transaction.from,
+        blockNumber: neo4j.int(transaction.blockNumber),
+        transactionIndex: neo4j.int(transaction.transactionIndex),
+        value: neo4j.int(transaction.value), // value is a web3 BigNumber
+        gas: neo4j.int(transaction.gas),
+        gasPrice: neo4j.int(transaction.gasPrice), // gas price is a web3 BigNumber
+        input: transaction.input,
+        toAddress: transaction.to,
+        blockHash: transaction.blockHash,
+        hash: transaction.hash
+    };
+    tx.run(queryCreateTransactionNode, paramsCreateTransactionNode)
+        .subscribe({
+            onNext: (record) => {
+                transactionResult = record;
+                winston.log('debug', 'Neo4jConnector - New transaction node created', {
+                    // node: record
+                });
+                callback(null, transactionResult);
+            },
+            onCompleted: () => {
+                //   session.close();
+            },
+            onError: (error) => {
+                winston.log('error', 'Neo4jConnector - Transaction statement failed:', {
+                    error: error.message
+                });
+                callback(error, null);
+            }
+        });
 };
 
 /**
